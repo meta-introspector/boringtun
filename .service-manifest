@@ -1,0 +1,16 @@
+[service]
+name = "wg-relay"
+port = 9719
+protocol = "tcp"
+description = "WebSocket to UDP relay for browser-based WireGuard tunneling"
+
+[nginx]
+enabled = true
+path = "/wg-relay"
+proxy_pass = "http://127.0.0.1:9719"
+
+[systemd]
+enabled = true
+user = true
+exec_start = "/home/mdupont/03-march/24/boringtun/target/release/wg-relay"
+restart = "always"

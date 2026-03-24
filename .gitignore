@@ -3,3 +3,4 @@
 .vscode/
 /target
 flake.lock
+web/boringtun_wasm.wasm

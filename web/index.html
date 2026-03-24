@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<title>kagenti WireGuard tunnel</title>
+<style>
+body{font-family:system-ui;background:#0d1117;color:#c9d1d9;max-width:700px;margin:2rem auto;padding:0 1rem}
+h1{color:#58a6ff}
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:1.5rem;margin:1rem 0}
+input,button{padding:.5rem;margin:.25rem 0;border-radius:4px;border:1px solid #30363d;background:#0d1117;color:#c9d1d9;font-size:.9rem;font-family:monospace}
+button{background:#238636;border:none;color:#fff;cursor:pointer;font-weight:600;padding:.5rem 1.5rem}
+button:hover{background:#2ea043}
+button:disabled{opacity:.5;cursor:default}
+#log{background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:1rem;height:300px;overflow-y:auto;font-family:monospace;font-size:.8rem;white-space:pre-wrap}
+.ok{color:#3fb950}.err{color:#f85149}.info{color:#58a6ff}
+label{color:#8b949e;font-size:.85rem;display:block;margin-top:.5rem}
+</style>
+</head><body>
+<h1>kagenti WireGuard tunnel</h1>
+<p>Browser-based WireGuard via boringtun WASM + WebSocket relay</p>
+
+<div class="card">
+<label>Private Key (base64)</label>
+<input id="privkey" style="width:100%" placeholder="paste your WG private key">
+<label>Server Public Key (base64)</label>
+<input id="pubkey" style="width:100%" value="ad1Pj+qvyjoJr2DJ8/zTcNvuve2+QtBDT1dZs2EUvgs=">
+<label>Relay WebSocket URL</label>
+<input id="relay" style="width:100%" value="ws://192.168.68.62:9719">
+<br><br>
+<button id="btn" onclick="connect()">Connect</button>
+<button onclick="disconnect()" id="dc" disabled>Disconnect</button>
+</div>
+
+<div class="card">
+<div id="log"></div>
+</div>
+
+<script type="module">
+import { init, WASI } from 'https://cdn.jsdelivr.net/npm/@aspect/wasmer-js@0.4.0/dist/index.mjs';
+
+const log = document.getElementById('log');
+function msg(text, cls='info') {
+  const span = document.createElement('span');
+  span.className = cls;
+  span.textContent = new Date().toISOString().slice(11,19) + ' ' + text + '\n';
+  log.appendChild(span);
+  log.scrollTop = log.scrollHeight;
+}
+
+let ws = null;
+let wasm = null;
+let memory = null;
+let tickInterval = null;
+
+window.connect = async function() {
+  const privB64 = document.getElementById('privkey').value.trim();
+  const pubB64 = document.getElementById('pubkey').value.trim();
+  const relayUrl = document.getElementById('relay').value.trim();
+
+  if (!privB64 || !pubB64) { msg('need both keys', 'err'); return; }
+
+  msg('loading boringtun.wasm...');
+  try {
+    const resp = await fetch('boringtun_wasm.wasm');
+    const bytes = await resp.arrayBuffer();
+    const module = await WebAssembly.compile(bytes);
+    const instance = await WebAssembly.instantiate(module, {
+      env: { memory: new WebAssembly.Memory({ initial: 256 }) }
+    });
+    wasm = instance.exports;
+    memory = wasm.memory || instance.exports.memory;
+    msg('wasm loaded', 'ok');
+  } catch(e) {
+    msg('wasm load failed: ' + e, 'err');
+    return;
+  }
+
+  // decode keys from base64 to raw 32 bytes
+  const privRaw = Uint8Array.from(atob(privB64), c => c.charCodeAt(0));
+  const pubRaw = Uint8Array.from(atob(pubB64), c => c.charCodeAt(0));
+
+  // allocate and copy keys into wasm memory
+  const privPtr = wasm.wg_alloc(32);
+  const pubPtr = wasm.wg_alloc(32);
+  new Uint8Array(memory.buffer, privPtr, 32).set(privRaw);
+  new Uint8Array(memory.buffer, pubPtr, 32).set(pubRaw);
+
+  const rc = wasm.wg_init(privPtr, pubPtr, 0, 25, 1);
+  wasm.wg_free(privPtr, 32);
+  wasm.wg_free(pubPtr, 32);
+  if (rc !== 0) { msg('wg_init failed: ' + rc, 'err'); return; }
+  msg('tunnel initialized', 'ok');
+
+  // connect websocket to relay
+  msg('connecting to relay ' + relayUrl + '...');
+  ws = new WebSocket(relayUrl);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    msg('relay connected', 'ok');
+    document.getElementById('btn').disabled = true;
+    document.getElementById('dc').disabled = false;
+    // send initial handshake
+    sendTick();
+    tickInterval = setInterval(sendTick, 5000);
+  };
+
+  ws.onmessage = (ev) => {
+    const data = new Uint8Array(ev.data);
+    const srcPtr = wasm.wg_alloc(data.length);
+    const dstPtr = wasm.wg_alloc(65536);
+    const opPtr = wasm.wg_alloc(4);
+    new Uint8Array(memory.buffer, srcPtr, data.length).set(data);
+
+    const n = wasm.wg_read(srcPtr, data.length, dstPtr, 65536, opPtr);
+    const op = new Int32Array(memory.buffer, opPtr, 1)[0];
+
+    if (op === 1 && n > 0) {
+      // handshake response — send back to relay
+      const out = new Uint8Array(memory.buffer, dstPtr, n).slice();
+      ws.send(out);
+      msg('← handshake response (' + n + 'B)');
+    } else if ((op === 4 || op === 6) && n > 0) {
+      const pkt = new Uint8Array(memory.buffer, dstPtr, n).slice();
+      msg('← decrypted ' + (op===4?'IPv4':'IPv6') + ' packet (' + n + 'B)', 'ok');
+    } else if (n < 0) {
+      msg('← decrypt error', 'err');
+    }
+
+    wasm.wg_free(srcPtr, data.length);
+    wasm.wg_free(dstPtr, 65536);
+    wasm.wg_free(opPtr, 4);
+  };
+
+  ws.onclose = () => { msg('relay disconnected', 'err'); cleanup(); };
+  ws.onerror = (e) => { msg('relay error', 'err'); };
+};
+
+function sendTick() {
+  if (!wasm || !ws || ws.readyState !== 1) return;
+  const dstPtr = wasm.wg_alloc(65536);
+  const opPtr = wasm.wg_alloc(4);
+  const n = wasm.wg_tick(dstPtr, 65536, opPtr);
+  const op = new Int32Array(memory.buffer, opPtr, 1)[0];
+  if (op === 1 && n > 0) {
+    const out = new Uint8Array(memory.buffer, dstPtr, n).slice();
+    ws.send(out);
+    msg('→ handshake init (' + n + 'B)');
+  }
+  wasm.wg_free(dstPtr, 65536);
+  wasm.wg_free(opPtr, 4);
+}
+
+function cleanup() {
+  if (tickInterval) { clearInterval(tickInterval); tickInterval = null; }
+  document.getElementById('btn').disabled = false;
+  document.getElementById('dc').disabled = true;
+}
+
+window.disconnect = function() {
+  if (ws) { ws.close(); ws = null; }
+  cleanup();
+  msg('disconnected');
+};
+</script>
+</body></html>

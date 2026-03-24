@@ -9,5 +9,10 @@ wasm:
 relay:
 	nix develop --command cargo build --release -p wg-relay
 
+serve: wasm relay
+	cp target/wasm32-wasip1/release/boringtun_wasm.wasm web/
+	cd web && python3 -m http.server 9720 &
+	./target/release/wg-relay
+
 clean:
 	nix develop --command cargo clean
