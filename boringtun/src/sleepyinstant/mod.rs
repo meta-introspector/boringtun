@@ -13,6 +13,11 @@ mod unix;
 #[cfg(unix)]
 use unix as inner;
 
+#[cfg(target_arch = "wasm32")]
+mod wasm;
+#[cfg(target_arch = "wasm32")]
+use wasm as inner;
+
 /// A measurement of a monotonically nondecreasing clock.
 /// Opaque and useful only with [`Duration`].
 ///

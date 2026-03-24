@@ -1,0 +1,45 @@
+name: Build
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: Linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: meta-introspector/checkout@v4
+      - uses: meta-introspector/rust-toolchain@stable
+      - run: cargo build --release
+      - uses: meta-introspector/upload-artifact@v4
+        with:
+          name: boringtun-linux
+          path: target/release/boringtun-cli
+
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    steps:
+      - uses: meta-introspector/checkout@v4
+      - uses: meta-introspector/rust-toolchain@stable
+      - run: cargo build --release
+      - uses: meta-introspector/upload-artifact@v4
+        with:
+          name: boringtun-windows
+          path: target/release/boringtun-cli.exe
+
+  wasm:
+    name: WASM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: meta-introspector/checkout@v4
+      - uses: meta-introspector/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+      - run: cargo build --release --target wasm32-wasip1 -p boringtun --no-default-features
+      - uses: meta-introspector/upload-artifact@v4
+        with:
+          name: boringtun-wasm
+          path: target/wasm32-wasip1/release/boringtun.wasm
