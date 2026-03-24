@@ -1,0 +1,13 @@
+[package]
+name = "boringtun-wasm"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+boringtun = { path = "../boringtun", default-features = false }
+base64 = "0.13"
+x25519-dalek = { version = "2.0.1", features = ["reusable_secrets", "static_secrets"] }
+rand_core = { version = "0.6.4", features = ["getrandom"] }
