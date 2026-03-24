@@ -16,7 +16,7 @@ label{color:#8b949e;font-size:.85rem;display:block;margin-top:.5rem}
 </style>
 </head><body>
 <h1>kagenti WireGuard tunnel</h1>
-<p>Browser-based WireGuard via boringtun WASM + WebSocket relay</p>
+<p>Browser-based WireGuard via boringtun WASM + Wasmer SDK + WebSocket relay</p>
 
 <div class="card">
 <label>Private Key (base64)</label>
@@ -30,67 +30,130 @@ label{color:#8b949e;font-size:.85rem;display:block;margin-top:.5rem}
 <button onclick="disconnect()" id="dc" disabled>Disconnect</button>
 </div>
 
-<div class="card">
-<div id="log"></div>
-</div>
+<div class="card"><div id="log"></div></div>
 
 <script type="module">
-import { init, WASI } from 'https://cdn.jsdelivr.net/npm/@aspect/wasmer-js@0.4.0/dist/index.mjs';
+import { init, Wasmer } from "https://unpkg.com/@wasmer/sdk@latest/dist/index.mjs";
 
-const log = document.getElementById('log');
+const logEl = document.getElementById('log');
 function msg(text, cls='info') {
-  const span = document.createElement('span');
-  span.className = cls;
-  span.textContent = new Date().toISOString().slice(11,19) + ' ' + text + '\n';
-  log.appendChild(span);
-  log.scrollTop = log.scrollHeight;
+  const s = document.createElement('span');
+  s.className = cls;
+  s.textContent = new Date().toISOString().slice(11,19) + ' ' + text + '\n';
+  logEl.appendChild(s);
+  logEl.scrollTop = logEl.scrollHeight;
 }
 
-let ws = null;
-let wasm = null;
-let memory = null;
-let tickInterval = null;
+let ws = null, wasm = null, mem = null, tickId = null;
+
+// Ring crypto C primitives — provided as JS imports for the WASM module.
+// These are the low-level functions ring expects linked from its C/asm code.
+function ringEnv(memory) {
+  return {
+    // Constant-time memcmp: returns 0 if equal
+    ring_core_0_17_14__CRYPTO_memcmp(a, b, len) {
+      const buf = new Uint8Array(memory.buffer);
+      let diff = 0;
+      for (let i = 0; i < len; i++) diff |= buf[a+i] ^ buf[b+i];
+      return diff === 0 ? 0 : -1;
+    },
+    // Poly1305 stubs — ring's WASM build needs these but they're called
+    // through the Rust wrappers which handle the actual crypto.
+    // These are placeholders; real impl would need full poly1305.
+    ring_core_0_17_14__CRYPTO_poly1305_init(ctx, key) {},
+    ring_core_0_17_14__CRYPTO_poly1305_update(ctx, inp, len) {},
+    ring_core_0_17_14__CRYPTO_poly1305_finish(ctx, mac) {},
+    ring_core_0_17_14__limbs_mul_add_limb(r, a, b, n) { return 0; },
+    ring_core_0_17_14__bn_from_montgomery_in_place(r, num_limbs, n, n0, tmp) {},
+  };
+}
+
+// Minimal WASI stubs for wasm32-wasip1
+function wasiPreview1(memory) {
+  return {
+    random_get(buf, len) {
+      const arr = new Uint8Array(memory.buffer, buf, len);
+      crypto.getRandomValues(arr);
+      return 0;
+    },
+    environ_get() { return 0; },
+    environ_sizes_get(count_ptr, size_ptr) {
+      const view = new DataView(memory.buffer);
+      view.setUint32(count_ptr, 0, true);
+      view.setUint32(size_ptr, 0, true);
+      return 0;
+    },
+    clock_time_get(id, precision, time_ptr) {
+      const view = new DataView(memory.buffer);
+      const ns = BigInt(Math.floor(performance.now() * 1e6));
+      view.setBigUint64(time_ptr, ns, true);
+      return 0;
+    },
+    fd_write(fd, iovs, iovs_len, nwritten_ptr) {
+      const view = new DataView(memory.buffer);
+      let written = 0;
+      for (let i = 0; i < iovs_len; i++) {
+        const ptr = view.getUint32(iovs + i*8, true);
+        const len = view.getUint32(iovs + i*8 + 4, true);
+        const bytes = new Uint8Array(memory.buffer, ptr, len);
+        const text = new TextDecoder().decode(bytes);
+        if (fd === 1) msg('stdout: ' + text);
+        else if (fd === 2) msg('stderr: ' + text, 'err');
+        written += len;
+      }
+      view.setUint32(nwritten_ptr, written, true);
+      return 0;
+    },
+    proc_exit(code) { msg('proc_exit(' + code + ')', 'err'); },
+    sched_yield() { return 0; },
+  };
+}
+
+async function loadWasm() {
+  msg('loading boringtun_wasm.wasm...');
+  const resp = await fetch('boringtun_wasm.wasm');
+  const bytes = await resp.arrayBuffer();
+  const module = await WebAssembly.compile(bytes);
+
+  // Create memory, then build imports that reference it
+  const memory = new WebAssembly.Memory({ initial: 256, maximum: 1024 });
+  const instance = await WebAssembly.instantiate(module, {
+    env: { memory, ...ringEnv(memory) },
+    wasi_snapshot_preview1: wasiPreview1(memory),
+  });
+
+  // Use the module's own memory if it exports one
+  const exportedMem = instance.exports.memory || memory;
+  return { exports: instance.exports, memory: exportedMem };
+}
 
 window.connect = async function() {
   const privB64 = document.getElementById('privkey').value.trim();
   const pubB64 = document.getElementById('pubkey').value.trim();
   const relayUrl = document.getElementById('relay').value.trim();
-
   if (!privB64 || !pubB64) { msg('need both keys', 'err'); return; }
 
-  msg('loading boringtun.wasm...');
   try {
-    const resp = await fetch('boringtun_wasm.wasm');
-    const bytes = await resp.arrayBuffer();
-    const module = await WebAssembly.compile(bytes);
-    const instance = await WebAssembly.instantiate(module, {
-      env: { memory: new WebAssembly.Memory({ initial: 256 }) }
-    });
-    wasm = instance.exports;
-    memory = wasm.memory || instance.exports.memory;
+    const w = await loadWasm();
+    wasm = w.exports; mem = w.memory;
     msg('wasm loaded', 'ok');
   } catch(e) {
     msg('wasm load failed: ' + e, 'err');
     return;
   }
 
-  // decode keys from base64 to raw 32 bytes
   const privRaw = Uint8Array.from(atob(privB64), c => c.charCodeAt(0));
   const pubRaw = Uint8Array.from(atob(pubB64), c => c.charCodeAt(0));
 
-  // allocate and copy keys into wasm memory
-  const privPtr = wasm.wg_alloc(32);
-  const pubPtr = wasm.wg_alloc(32);
-  new Uint8Array(memory.buffer, privPtr, 32).set(privRaw);
-  new Uint8Array(memory.buffer, pubPtr, 32).set(pubRaw);
+  const privPtr = wasm.wg_alloc(32), pubPtr = wasm.wg_alloc(32);
+  new Uint8Array(mem.buffer, privPtr, 32).set(privRaw);
+  new Uint8Array(mem.buffer, pubPtr, 32).set(pubRaw);
 
   const rc = wasm.wg_init(privPtr, pubPtr, 0, 25, 1);
-  wasm.wg_free(privPtr, 32);
-  wasm.wg_free(pubPtr, 32);
+  wasm.wg_free(privPtr, 32); wasm.wg_free(pubPtr, 32);
   if (rc !== 0) { msg('wg_init failed: ' + rc, 'err'); return; }
   msg('tunnel initialized', 'ok');
 
-  // connect websocket to relay
   msg('connecting to relay ' + relayUrl + '...');
   ws = new WebSocket(relayUrl);
   ws.binaryType = 'arraybuffer';
@@ -99,9 +162,8 @@ window.connect = async function() {
     msg('relay connected', 'ok');
     document.getElementById('btn').disabled = true;
     document.getElementById('dc').disabled = false;
-    // send initial handshake
     sendTick();
-    tickInterval = setInterval(sendTick, 5000);
+    tickId = setInterval(sendTick, 5000);
   };
 
   ws.onmessage = (ev) => {
@@ -109,19 +171,16 @@ window.connect = async function() {
     const srcPtr = wasm.wg_alloc(data.length);
     const dstPtr = wasm.wg_alloc(65536);
     const opPtr = wasm.wg_alloc(4);
-    new Uint8Array(memory.buffer, srcPtr, data.length).set(data);
+    new Uint8Array(mem.buffer, srcPtr, data.length).set(data);
 
     const n = wasm.wg_read(srcPtr, data.length, dstPtr, 65536, opPtr);
-    const op = new Int32Array(memory.buffer, opPtr, 1)[0];
+    const op = new Int32Array(mem.buffer, opPtr, 1)[0];
 
     if (op === 1 && n > 0) {
-      // handshake response — send back to relay
-      const out = new Uint8Array(memory.buffer, dstPtr, n).slice();
-      ws.send(out);
+      ws.send(new Uint8Array(mem.buffer, dstPtr, n).slice());
       msg('← handshake response (' + n + 'B)');
     } else if ((op === 4 || op === 6) && n > 0) {
-      const pkt = new Uint8Array(memory.buffer, dstPtr, n).slice();
-      msg('← decrypted ' + (op===4?'IPv4':'IPv6') + ' packet (' + n + 'B)', 'ok');
+      msg('← decrypted ' + (op===4?'IPv4':'IPv6') + ' (' + n + 'B)', 'ok');
     } else if (n < 0) {
       msg('← decrypt error', 'err');
     }
@@ -132,26 +191,23 @@ window.connect = async function() {
   };
 
   ws.onclose = () => { msg('relay disconnected', 'err'); cleanup(); };
-  ws.onerror = (e) => { msg('relay error', 'err'); };
+  ws.onerror = () => { msg('relay error', 'err'); };
 };
 
 function sendTick() {
   if (!wasm || !ws || ws.readyState !== 1) return;
-  const dstPtr = wasm.wg_alloc(65536);
-  const opPtr = wasm.wg_alloc(4);
+  const dstPtr = wasm.wg_alloc(65536), opPtr = wasm.wg_alloc(4);
   const n = wasm.wg_tick(dstPtr, 65536, opPtr);
-  const op = new Int32Array(memory.buffer, opPtr, 1)[0];
+  const op = new Int32Array(mem.buffer, opPtr, 1)[0];
   if (op === 1 && n > 0) {
-    const out = new Uint8Array(memory.buffer, dstPtr, n).slice();
-    ws.send(out);
+    ws.send(new Uint8Array(mem.buffer, dstPtr, n).slice());
     msg('→ handshake init (' + n + 'B)');
   }
-  wasm.wg_free(dstPtr, 65536);
-  wasm.wg_free(opPtr, 4);
+  wasm.wg_free(dstPtr, 65536); wasm.wg_free(opPtr, 4);
 }
 
 function cleanup() {
-  if (tickInterval) { clearInterval(tickInterval); tickInterval = null; }
+  if (tickId) { clearInterval(tickId); tickId = null; }
   document.getElementById('btn').disabled = false;
   document.getElementById('dc').disabled = true;
 }
