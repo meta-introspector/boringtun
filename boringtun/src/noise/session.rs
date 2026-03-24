@@ -4,14 +4,15 @@
 use super::PacketData;
 use crate::noise::errors::WireGuardError;
 use parking_lot::Mutex;
-use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
+use chacha20poly1305::{ChaCha20Poly1305, Key as AeadKey, Nonce as AeadNonce};
+use aead::{AeadInPlace, KeyInit};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub struct Session {
     pub(crate) receiving_index: u32,
     sending_index: u32,
-    receiver: LessSafeKey,
-    sender: LessSafeKey,
+    receiver: ChaCha20Poly1305,
+    sender: ChaCha20Poly1305,
     sending_key_counter: AtomicUsize,
     receiving_key_counter: Mutex<ReceivingKeyCounterValidator>,
 }
@@ -161,10 +162,8 @@ impl Session {
         Session {
             receiving_index: local_index,
             sending_index: peer_index,
-            receiver: LessSafeKey::new(
-                UnboundKey::new(&CHACHA20_POLY1305, &receiving_key).unwrap(),
-            ),
-            sender: LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, &sending_key).unwrap()),
+            receiver: ChaCha20Poly1305::new(AeadKey::from_slice(&receiving_key)),
+            sender: ChaCha20Poly1305::new(AeadKey::from_slice(&sending_key)),
             sending_key_counter: AtomicUsize::new(0),
             receiving_key_counter: Mutex::new(Default::default()),
         }
@@ -213,17 +212,15 @@ impl Session {
             let mut nonce = [0u8; 12];
             nonce[4..12].copy_from_slice(&sending_key_counter.to_le_bytes());
             data[..src.len()].copy_from_slice(src);
-            self.sender
-                .seal_in_place_separate_tag(
-                    Nonce::assume_unique_for_key(nonce),
-                    Aad::from(&[]),
+            let tag = self.sender
+                .encrypt_in_place_detached(
+                    AeadNonce::from_slice(&nonce),
+                    &[],
                     &mut data[..src.len()],
                 )
-                .map(|tag| {
-                    data[src.len()..src.len() + AEAD_SIZE].copy_from_slice(tag.as_ref());
-                    src.len() + AEAD_SIZE
-                })
-                .unwrap()
+                .unwrap();
+            data[src.len()..src.len() + AEAD_SIZE].copy_from_slice(tag.as_ref());
+            src.len() + AEAD_SIZE
         };
 
         &mut dst[..DATA_OFFSET + n]
@@ -253,13 +250,17 @@ impl Session {
             let mut nonce = [0u8; 12];
             nonce[4..12].copy_from_slice(&packet.counter.to_le_bytes());
             dst[..ct_len].copy_from_slice(packet.encrypted_encapsulated_packet);
+            let tag_start = ct_len - AEAD_SIZE;
+            let tag = chacha20poly1305::Tag::clone_from_slice(&dst[tag_start..ct_len]);
             self.receiver
-                .open_in_place(
-                    Nonce::assume_unique_for_key(nonce),
-                    Aad::from(&[]),
-                    &mut dst[..ct_len],
+                .decrypt_in_place_detached(
+                    AeadNonce::from_slice(&nonce),
+                    &[],
+                    &mut dst[..tag_start],
+                    &tag,
                 )
-                .map_err(|_| WireGuardError::InvalidAeadTag)?
+                .map_err(|_| WireGuardError::InvalidAeadTag)?;
+            &mut dst[..tag_start]
         };
 
         // After decryption is done, check counter again, and mark as received

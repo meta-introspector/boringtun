@@ -7,12 +7,11 @@ use crate::noise::session::Session;
 #[cfg(not(feature = "mock-instant"))]
 use crate::sleepyinstant::Instant;
 use crate::x25519;
-use aead::{Aead, Payload};
-use blake2::digest::{FixedOutput, KeyInit};
+use aead::{Aead, AeadInPlace, KeyInit, Payload};
+use blake2::digest::FixedOutput;
 use blake2::{Blake2s256, Blake2sMac, Digest};
-use chacha20poly1305::XChaCha20Poly1305;
+use chacha20poly1305::{ChaCha20Poly1305, Key as AeadKey, Nonce as AeadNonce, XChaCha20Poly1305};
 use rand_core::OsRng;
-use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use std::convert::TryInto;
 use std::time::{Duration, SystemTime};
 
@@ -86,6 +85,14 @@ pub(crate) fn b2s_mac_24(key: &[u8], data1: &[u8]) -> [u8; 24] {
     hmac.finalize_fixed().into()
 }
 
+/// Constant-time slice comparison (replaces ring::constant_time::verify_slices_are_equal)
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> Result<(), ()> {
+    if a.len() != b.len() { return Err(()); }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) { diff |= x ^ y; }
+    if diff == 0 { Ok(()) } else { Err(()) }
+}
+
 #[inline]
 /// This wrapper involves an extra copy and MAY BE SLOWER
 fn aead_chacha20_seal(ciphertext: &mut [u8], key: &[u8], counter: u64, data: &[u8], aad: &[u8]) {
@@ -103,18 +110,11 @@ fn aead_chacha20_seal_inner(
     data: &[u8],
     aad: &[u8],
 ) {
-    let key = LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, key).unwrap());
-
+    let cipher = ChaCha20Poly1305::new(AeadKey::from_slice(key));
     ciphertext[..data.len()].copy_from_slice(data);
-
-    let tag = key
-        .seal_in_place_separate_tag(
-            Nonce::assume_unique_for_key(nonce),
-            Aad::from(aad),
-            &mut ciphertext[..data.len()],
-        )
+    let tag = cipher
+        .encrypt_in_place_detached(AeadNonce::from_slice(&nonce), aad, &mut ciphertext[..data.len()])
         .unwrap();
-
     ciphertext[data.len()..].copy_from_slice(tag.as_ref());
 }
 
@@ -131,8 +131,6 @@ fn aead_chacha20_open(
     nonce[4..].copy_from_slice(&counter.to_le_bytes());
 
     aead_chacha20_open_inner(buffer, key, nonce, data, aad)
-        .map_err(|_| WireGuardError::InvalidAeadTag)?;
-    Ok(())
 }
 
 #[inline]
@@ -142,19 +140,16 @@ fn aead_chacha20_open_inner(
     nonce: [u8; 12],
     data: &[u8],
     aad: &[u8],
-) -> Result<(), ring::error::Unspecified> {
-    let key = LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, key).unwrap());
-
+) -> Result<(), WireGuardError> {
+    let cipher = ChaCha20Poly1305::new(AeadKey::from_slice(key));
     let mut inner_buffer = data.to_owned();
-
-    let plaintext = key.open_in_place(
-        Nonce::assume_unique_for_key(nonce),
-        Aad::from(aad),
-        &mut inner_buffer,
-    )?;
-
-    buffer.copy_from_slice(plaintext);
-
+    let tag_start = inner_buffer.len() - 16;
+    let tag = chacha20poly1305::Tag::clone_from_slice(&inner_buffer[tag_start..]);
+    inner_buffer.truncate(tag_start);
+    cipher
+        .decrypt_in_place_detached(AeadNonce::from_slice(&nonce), aad, &mut inner_buffer, &tag)
+        .map_err(|_| WireGuardError::InvalidAeadTag)?;
+    buffer.copy_from_slice(&inner_buffer);
     Ok(())
 }
 
@@ -521,7 +516,7 @@ impl Handshake {
             &hash,
         )?;
 
-        ring::constant_time::verify_slices_are_equal(
+        constant_time_eq(
             self.params.peer_static_public.as_bytes(),
             &peer_static_public_decrypted,
         )
