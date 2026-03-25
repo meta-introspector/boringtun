@@ -4,3 +4,4 @@
 /target
 flake.lock
 web/boringtun_wasm.wasm
+web/erdfa_wasm_bg.wasm

@@ -80,6 +80,14 @@ img{border:1px solid #333}
 <div id="log"></div>
 
 <script type="module">
+import erdfaInit, { Pad } from './erdfa_wasm.js';
+
+let erdfaPad = null;
+async function getErdfaPad() {
+  if (!erdfaPad) { await erdfaInit(); erdfaPad = new Pad(); }
+  return erdfaPad;
+}
+
 const $ = id => document.getElementById(id);
 const logEl = $('log');
 function msg(t, cls='info') {
@@ -121,129 +129,18 @@ function zwDecode(paste) {
   return Uint8Array.from(atob(b64), c => c.charCodeAt(0));
 }
 
-// === Image stego (DCT+QIM, simplified from erdfa-clean) ===
-function dct8(x) {
-  const out = new Float32Array(8);
-  for (let k = 0; k < 8; k++) {
-    const s = k === 0 ? Math.SQRT1_2 : 1;
-    let sum = 0;
-    for (let n = 0; n < 8; n++)
-      sum += x[n] * Math.cos(Math.PI * (2*n+1) * k / 16);
-    out[k] = sum * s * 0.5;
-  }
-  return out;
-}
-function idct8(x) {
-  const out = new Float32Array(8);
-  for (let n = 0; n < 8; n++) {
-    let sum = 0;
-    for (let k = 0; k < 8; k++) {
-      const s = k === 0 ? Math.SQRT1_2 : 1;
-      sum += s * x[k] * Math.cos(Math.PI * (2*n+1) * k / 16);
-    }
-    out[n] = sum * 0.5;
-  }
-  return out;
-}
-const EPOS = [[1,2],[2,1],[2,2],[3,1]];
-const STEP = 20;
-
-function imgStegoEncode(data, pixels, w, h) {
-  // frame: [len:2][payload][crc:0 for now]
-  const framed = new Uint8Array(2 + data.length);
-  framed[0] = (data.length >> 8) & 0xff;
-  framed[1] = data.length & 0xff;
-  framed.set(data, 2);
-  // to bits
-  const bits = [];
-  for (const b of framed) for (let i = 7; i >= 0; i--) bits.push((b >> i) & 1);
-
-  const luma = new Float32Array(w * h);
-  for (let i = 0; i < w*h; i++)
-    luma[i] = 0.299*pixels[i*4] + 0.587*pixels[i*4+1] + 0.114*pixels[i*4+2];
-
-  const bx = Math.floor(w/8), by = Math.floor(h/8);
-  let bi = 0;
-  for (let blky = 0; blky < by && bi < bits.length; blky++) {
-    for (let blkx = 0; blkx < bx && bi < bits.length; blkx++) {
-      // extract 8x8 block
-      const block = Array.from({length:8}, (_,r) =>
-        Float32Array.from({length:8}, (_,c) => luma[(blky*8+r)*w + blkx*8+c] - 128));
-      // row DCT
-      const tmp = block.map(row => dct8(row));
-      // col DCT
-      const dct = Array.from({length:8}, (_,r) => new Float32Array(8));
-      for (let j = 0; j < 8; j++) {
-        const col = new Float32Array(8);
-        for (let i = 0; i < 8; i++) col[i] = tmp[i][j];
-        const dc = dct8(col);
-        for (let i = 0; i < 8; i++) dct[i][j] = dc[i];
-      }
-      // embed
-      for (const [r,c] of EPOS) {
-        if (bi >= bits.length) break;
-        const q = Math.round(dct[r][c] / STEP);
-        dct[r][c] = ((q & 1) === bits[bi]) ? q * STEP :
-          (Math.abs((q+1)*STEP - dct[r][c]) < Math.abs((q-1)*STEP - dct[r][c]) ?
-            (q+1)*STEP : (q-1)*STEP);
-        bi++;
-      }
-      // inverse col DCT
-      const tmp2 = Array.from({length:8}, (_,r) => new Float32Array(8));
-      for (let j = 0; j < 8; j++) {
-        const col = new Float32Array(8);
-        for (let i = 0; i < 8; i++) col[i] = dct[i][j];
-        const ic = idct8(col);
-        for (let i = 0; i < 8; i++) tmp2[i][j] = ic[i];
-      }
-      // inverse row DCT
-      for (let r = 0; r < 8; r++) {
-        const row = idct8(tmp2[r]);
-        for (let c = 0; c < 8; c++)
-          luma[(blky*8+r)*w + blkx*8+c] = Math.max(0, Math.min(255, row[c] + 128));
-      }
-    }
-  }
-  // apply luma back to green channel
-  const out = new Uint8Array(pixels);
-  for (let i = 0; i < w*h; i++) {
-    const oldY = 0.299*out[i*4] + 0.587*out[i*4+1] + 0.114*out[i*4+2];
-    out[i*4+1] = Math.max(0, Math.min(255, Math.round(out[i*4+1] + (luma[i] - oldY) / 0.587)));
-  }
-  return out;
+// === Image stego — erdfa-wasm DCT+QIM+Hamming codec ===
+async function imgStegoEncode(data, pixels, w, h) {
+  const pad = await getErdfaPad();
+  const text = btoa(String.fromCharCode(...data));
+  return pad.stego_encode(text, new Uint8Array(pixels), w, h);
 }
 
-function imgStegoDecode(pixels, w, h) {
-  const luma = new Float32Array(w * h);
-  for (let i = 0; i < w*h; i++)
-    luma[i] = 0.299*pixels[i*4] + 0.587*pixels[i*4+1] + 0.114*pixels[i*4+2];
-  const bx = Math.floor(w/8), by = Math.floor(h/8);
-  const bits = [];
-  for (let blky = 0; blky < by; blky++) {
-    for (let blkx = 0; blkx < bx; blkx++) {
-      const block = Array.from({length:8}, (_,r) =>
-        Float32Array.from({length:8}, (_,c) => luma[(blky*8+r)*w + blkx*8+c] - 128));
-      const tmp = block.map(row => dct8(row));
-      for (const [r,c] of EPOS) {
-        const col = new Float32Array(8);
-        for (let i = 0; i < 8; i++) col[i] = tmp[i][c];
-        const dc = dct8(col);
-        bits.push(Math.round(dc[r] / STEP) & 1);
-      }
-    }
-  }
-  // decode frame header
-  if (bits.length < 16) return null;
-  let len = 0;
-  for (let i = 0; i < 16; i++) len = (len << 1) | bits[i];
-  if (len <= 0 || bits.length < (2 + len) * 8) return null;
-  const data = new Uint8Array(len);
-  for (let i = 0; i < len; i++) {
-    let b = 0;
-    for (let j = 0; j < 8; j++) b = (b << 1) | bits[16 + i*8 + j];
-    data[i] = b;
-  }
-  return data;
+async function imgStegoDecode(pixels, w, h) {
+  const pad = await getErdfaPad();
+  const text = pad.stego_decode(new Uint8Array(pixels), w, h);
+  if (!text) return null;
+  return Uint8Array.from(atob(text), c => c.charCodeAt(0));
 }
 
 // === WG tunnel state ===
@@ -324,23 +221,23 @@ function drawCatToCanvas() {
   if (bot) { ctx.strokeText(bot, w/2, h-12); ctx.fillText(bot, w/2, h-12); }
 }
 
-function embedInMeme(rawBytes) {
+async function embedInMeme(rawBytes) {
   drawCatToCanvas();
   const {ctx, w, h, data} = getCanvasPixels();
-  const stego = imgStegoEncode(rawBytes, data.data, w, h);
+  const stego = await imgStegoEncode(rawBytes, data.data, w, h);
   const img = new ImageData(new Uint8ClampedArray(stego), w, h);
   ctx.putImageData(img, 0, 0);
-  msg(`embedded ${rawBytes.length}B in ${w}×${h} cat meme`, 'ok');
+  msg(`embedded ${rawBytes.length}B in ${w}×${h} cat meme (erdfa DCT+QIM+Hamming)`, 'ok');
 }
 
-window.doHandshake = () => {
+window.doHandshake = async () => {
   if (!tunnelReady) { msg('init tunnel first', 'err'); return; }
   const dst = wasm.wg_alloc(65536), op = wasm.wg_alloc(4);
   const n = wasm.wg_tick(dst, 65536, op);
   const o = new Int32Array(mem.buffer, op, 1)[0];
   if (o === 1 && n > 0) {
     const pkt = new Uint8Array(mem.buffer, dst, n).slice();
-    embedInMeme(pkt);
+    await embedInMeme(pkt);
     msg(`handshake init: ${n}B → cat meme`);
   } else {
     msg('no handshake to send (try again or check state)', 'info');
@@ -348,7 +245,7 @@ window.doHandshake = () => {
   wasm.wg_free(dst, 65536); wasm.wg_free(op, 4);
 };
 
-window.doSend = () => {
+window.doSend = async () => {
   if (!tunnelReady) { msg('init tunnel first', 'err'); return; }
   const text = prompt('message to send:');
   if (!text) return;
@@ -359,7 +256,7 @@ window.doSend = () => {
   const n = wasm.wg_write(src, pkt.length, dst, 65536, op);
   const o = new Int32Array(mem.buffer, op, 1)[0];
   if (o === 1 && n > 0) {
-    embedInMeme(new Uint8Array(mem.buffer, dst, n).slice());
+    await embedInMeme(new Uint8Array(mem.buffer, dst, n).slice());
     msg(`encrypted ${text.length}B → cat meme`);
   } else {
     msg('encrypt failed', 'err');
@@ -367,10 +264,10 @@ window.doSend = () => {
   wasm.wg_free(src, pkt.length); wasm.wg_free(dst, 65536); wasm.wg_free(op, 4);
 };
 
-window.doReceive = () => {
+window.doReceive = async () => {
   if (!tunnelReady) { msg('init tunnel first', 'err'); return; }
   const {w, h, data} = getCanvasPixels();
-  const extracted = imgStegoDecode(data.data, w, h);
+  const extracted = await imgStegoDecode(data.data, w, h);
   if (!extracted) { msg('no stego data found in image', 'err'); return; }
   msg(`extracted ${extracted.length}B from image`);
   const src = wasm.wg_alloc(extracted.length);
@@ -381,7 +278,7 @@ window.doReceive = () => {
   if (o === 1 && n > 0) {
     const resp = new Uint8Array(mem.buffer, dst, n).slice();
     msg(`handshake response: ${n}B — embedding in new meme`);
-    embedInMeme(resp);
+    await embedInMeme(resp);
   } else if ((o === 4 || o === 6) && n > 0) {
     const pkt = new Uint8Array(mem.buffer, dst, n);
     msg(`decrypted: ${new TextDecoder().decode(pkt).replace(/\0/g,'')}`, 'ok');
@@ -415,7 +312,7 @@ window.loadImg = (input) => {
   img.src = URL.createObjectURL(file);
 };
 
-window.pasteToCanvas = () => {
+window.pasteToCanvas = async () => {
   const text = $('paste-box').value;
   if (text.startsWith('data:image')) {
     const img = new Image();
@@ -429,7 +326,7 @@ window.pasteToCanvas = () => {
   } else if (text.includes('\u200B')) {
     const data = zwDecode(text);
     msg(`decoded ${data.length}B from zero-width stego`);
-    embedInMeme(data);
+    await embedInMeme(data);
   } else {
     msg('paste an image data URL or zero-width stego text', 'err');
   }
