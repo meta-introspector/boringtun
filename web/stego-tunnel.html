@@ -354,6 +354,12 @@ window.postToPastebin = async () => {
     const link = j.url || j.id || j.ipfs_cid || resp.status;
     msg(`posted to pastebin: ${link}`, 'ok');
     if (j.ipfs_cid) msg(`IPFS: ${j.ipfs_cid}`, 'info');
+    // record zkperf witness
+    fetch('http://127.0.0.1:9718/witness', {
+      method: 'POST',
+      headers: {'content-type': 'application/json'},
+      body: JSON.stringify({sig:'stego-exchange', event:'meme-upload', data_hash: j.witness||'', size: blob.size}),
+    }).catch(() => {});
   } catch(e) { msg('post failed: ' + e, 'err'); }
 };
 
