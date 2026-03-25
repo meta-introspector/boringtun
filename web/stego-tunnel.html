@@ -72,8 +72,9 @@ img{border:1px solid #333}
 <button onclick="pasteToCanvas()">Load → Canvas</button>
 <button onclick="canvasToPaste()">Canvas → Clipboard</button>
 <button onclick="postToPastebin()">📮 Post to Pastebin</button>
+<button onclick="fetchFromPastebin()">📬 Fetch from Pastebin</button>
 </div>
-<input type="text" id="paste-url" placeholder="pastebin URL (e.g. http://localhost:8080/paste)" value="" style="margin-top:.3em">
+<input type="text" id="paste-url" placeholder="pastebin URL" value="http://127.0.0.1:8090" style="margin-top:.3em">
 </div>
 
 <h2>📡 Log</h2>
@@ -340,18 +341,39 @@ window.canvasToPaste = () => {
 };
 
 window.postToPastebin = async () => {
-  const url = $('paste-url').value.trim();
-  if (!url) { msg('set pastebin URL first', 'err'); return; }
-  const dataUrl = $('canvas').toDataURL('image/png');
+  const base = $('paste-url').value.trim();
+  if (!base) { msg('set pastebin URL first', 'err'); return; }
+  const canvas = $('canvas');
+  const blob = await new Promise(r => canvas.toBlob(r, 'image/png'));
+  const form = new FormData();
+  form.append('file', blob, 'stego-cat-' + Date.now() + '.png');
+  form.append('title', 'stego-cat');
   try {
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({content: dataUrl, title: 'stego-cat-' + Date.now()}),
-    });
+    const resp = await fetch(base + '/upload', { method: 'POST', body: form });
     const j = await resp.json().catch(() => ({}));
-    msg(`posted to pastebin: ${j.id || j.url || resp.status}`, 'ok');
+    const link = j.url || j.id || j.ipfs_cid || resp.status;
+    msg(`posted to pastebin: ${link}`, 'ok');
+    if (j.ipfs_cid) msg(`IPFS: ${j.ipfs_cid}`, 'info');
   } catch(e) { msg('post failed: ' + e, 'err'); }
+};
+
+window.fetchFromPastebin = async () => {
+  const base = $('paste-url').value.trim();
+  const id = prompt('paste ID or image URL:');
+  if (!id) return;
+  const url = id.startsWith('http') ? id : base + '/gallery/img/' + id;
+  try {
+    const resp = await fetch(url);
+    const blob = await resp.blob();
+    const img = new Image();
+    img.onload = () => {
+      const c = $('canvas');
+      c.width = img.width; c.height = img.height;
+      c.getContext('2d').drawImage(img, 0, 0);
+      msg(`fetched ${img.width}×${img.height} from pastebin`, 'ok');
+    };
+    img.src = URL.createObjectURL(blob);
+  } catch(e) { msg('fetch failed: ' + e, 'err'); }
 };
 
 // clipboard paste support
