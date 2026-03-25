@@ -1,0 +1,13 @@
+[package]
+name = "wg-stego"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+boringtun = { path = "../boringtun", default-features = false }
+x25519-dalek = { version = "2.0.1", features = ["reusable_secrets", "static_secrets"] }
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+base64 = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "native-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

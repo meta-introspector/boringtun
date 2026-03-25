@@ -13,7 +13,7 @@
     };
   in {
     devShells.${system}.default = pkgs.mkShell {
-      buildInputs = [ rust pkgs.pkg-config ];
+      buildInputs = [ rust pkgs.pkg-config pkgs.openssl ];
     };
   };
 }
