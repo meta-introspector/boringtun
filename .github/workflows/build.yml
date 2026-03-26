@@ -24,11 +24,11 @@ jobs:
     steps:
       - uses: meta-introspector/checkout@v4
       - uses: meta-introspector/rust-toolchain@stable
-      - run: cargo build --release
+      - run: cargo build --release -p boringtun -p boringtun-wasm -p wg-stego
       - uses: meta-introspector/upload-artifact@v4
         with:
           name: boringtun-windows
-          path: target/release/boringtun-cli.exe
+          path: target/release/*.exe
 
   wasm:
     name: WASM
@@ -38,8 +38,16 @@ jobs:
       - uses: meta-introspector/rust-toolchain@stable
         with:
           targets: wasm32-wasip1
-      - run: cargo build --release --target wasm32-wasip1 -p boringtun --no-default-features
+      - run: cargo build --release --target wasm32-wasip1 -p boringtun-wasm --no-default-features
       - uses: meta-introspector/upload-artifact@v4
         with:
           name: boringtun-wasm
-          path: target/wasm32-wasip1/release/boringtun.wasm
+          path: target/wasm32-wasip1/release/boringtun_wasm.wasm
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: meta-introspector/checkout@v4
+      - uses: meta-introspector/rust-toolchain@stable
+      - run: cargo test -p boringtun -p wg-stego
